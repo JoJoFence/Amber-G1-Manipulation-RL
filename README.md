@@ -2,7 +2,9 @@
 
 Reinforcement learning for bimanual manipulation on the Unitree G1 humanoid robot using [Isaac Lab](https://isaac-sim.github.io/IsaacLab/).
 
-![G1 Reaching Demo](assets/reach_demo_video.gif)
+<p align="center">
+   <img src="assets/reach_demo_video.gif" width="700" alt="G1 Reaching Demo Video">
+</p>
 
 
 ## Overview
