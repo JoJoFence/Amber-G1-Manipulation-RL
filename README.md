@@ -142,7 +142,7 @@ Then open `http://localhost:6006` in your browser.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Policy Network                        │
+│                        Policy Network                       │
 │                     [256, 128, 64] MLP                      │
 ├─────────────────────────────────────────────────────────────┤
 │  Observations (46D)           │  Actions (6D)               │
@@ -157,7 +157,7 @@ Then open `http://localhost:6006` in your browser.
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Differential IK Controller                      │
+│              Differential IK Controller                     │
 │  ├─ Left arm: 4 DOF (shoulder + elbow)                      │
 │  └─ Right arm: 4 DOF (shoulder + elbow)                     │
 │  Wrists held at neutral by PD controllers                   │
@@ -165,8 +165,8 @@ Then open `http://localhost:6006` in your browser.
                                 │
                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    G1 Upper Body                             │
-│            14 DOF: 7 per arm (3 shoulder + 1 elbow + 3 wrist)│
+│                    G1 Upper Body                            │
+│     14 DOF: 7 per arm (3 shoulder + 1 elbow + 3 wrist)      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
