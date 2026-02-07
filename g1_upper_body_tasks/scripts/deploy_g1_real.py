@@ -48,7 +48,26 @@ from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwi
 
 class G1JointIndex:
     """Joint indices for G1 robot (29 DOF version)."""
-    # Left arm
+    # Legs (indices 0-11, not used for arm control)
+    LeftHipPitch = 0
+    LeftHipRoll = 1
+    LeftHipYaw = 2
+    LeftKnee = 3
+    LeftAnklePitch = 4
+    LeftAnkleRoll = 5
+    RightHipPitch = 6
+    RightHipRoll = 7
+    RightHipYaw = 8
+    RightKnee = 9
+    RightAnklePitch = 10
+    RightAnkleRoll = 11
+
+    # Waist (indices 12-14)
+    WaistYaw = 12
+    WaistRoll = 13   # NOTE: May be locked on g1 23dof/29dof with waist locked
+    WaistPitch = 14  # NOTE: May be locked on g1 23dof/29dof with waist locked
+
+    # Left arm (indices 15-21)
     LeftShoulderPitch = 15
     LeftShoulderRoll = 16
     LeftShoulderYaw = 17
@@ -57,7 +76,7 @@ class G1JointIndex:
     LeftWristPitch = 20
     LeftWristYaw = 21
 
-    # Right arm
+    # Right arm (indices 22-28)
     RightShoulderPitch = 22
     RightShoulderRoll = 23
     RightShoulderYaw = 24
@@ -66,6 +85,33 @@ class G1JointIndex:
     RightWristPitch = 27
     RightWristYaw = 28
 
+
+# Waist joint indices
+WAIST_JOINTS = [
+    G1JointIndex.WaistYaw,
+    G1JointIndex.WaistRoll,
+    G1JointIndex.WaistPitch,
+]
+
+# Default waist position (neutral/zero)
+DEFAULT_WAIST_POSITIONS = {
+    G1JointIndex.WaistYaw: 0.0,
+    G1JointIndex.WaistRoll: 0.0,
+    G1JointIndex.WaistPitch: 0.0,
+}
+
+# PD gains for waist (from Unitree example)
+WAIST_KP = {
+    G1JointIndex.WaistYaw: 60.0,
+    G1JointIndex.WaistRoll: 40.0,
+    G1JointIndex.WaistPitch: 40.0,
+}
+
+WAIST_KD = {
+    G1JointIndex.WaistYaw: 1.0,
+    G1JointIndex.WaistRoll: 1.0,
+    G1JointIndex.WaistPitch: 1.0,
+}
 
 # Arm joint indices (matching simulation order)
 LEFT_ARM_JOINTS = [
@@ -489,6 +535,15 @@ class G1PolicyDeployer:
         self.low_cmd.mode_pr = 0
         self.low_cmd.mode_machine = self.mode_machine
 
+        # Waist joints - hold at neutral position
+        for joint_idx in WAIST_JOINTS:
+            self.low_cmd.motor_cmd[joint_idx].mode = 1
+            self.low_cmd.motor_cmd[joint_idx].q = DEFAULT_WAIST_POSITIONS[joint_idx]
+            self.low_cmd.motor_cmd[joint_idx].dq = 0.0
+            self.low_cmd.motor_cmd[joint_idx].kp = WAIST_KP[joint_idx]
+            self.low_cmd.motor_cmd[joint_idx].kd = WAIST_KD[joint_idx]
+            self.low_cmd.motor_cmd[joint_idx].tau = 0.0
+
         # Left arm
         for i, joint_idx in enumerate(LEFT_ARM_IK_JOINTS):
             self.low_cmd.motor_cmd[joint_idx].mode = 1
@@ -519,15 +574,21 @@ class G1PolicyDeployer:
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.lowcmd_publisher.Write(self.low_cmd)
 
+    def get_waist_joint_positions(self) -> np.ndarray:
+        """Get current waist joint positions."""
+        return np.array([self.low_state.motor_state[i].q for i in WAIST_JOINTS])
+
     def move_to_default_pose(self, duration: float = 3.0):
-        """Smoothly move arms to default pose."""
+        """Smoothly move arms and waist to default pose."""
         print("Moving to default pose...")
 
         start_time = time.time()
         left_start, right_start = self.get_arm_joint_positions()
+        waist_start = self.get_waist_joint_positions()
 
         left_default = np.array([DEFAULT_ARM_POSITIONS[i] for i in LEFT_ARM_JOINTS])
         right_default = np.array([DEFAULT_ARM_POSITIONS[i] for i in RIGHT_ARM_JOINTS])
+        waist_default = np.array([DEFAULT_WAIST_POSITIONS[i] for i in WAIST_JOINTS])
 
         while time.time() - start_time < duration:
             t = (time.time() - start_time) / duration
@@ -535,11 +596,22 @@ class G1PolicyDeployer:
 
             left_target = left_start + alpha * (left_default - left_start)
             right_target = right_start + alpha * (right_default - right_start)
+            waist_target = waist_start + alpha * (waist_default - waist_start)
 
             # Send commands
             self.low_cmd.mode_pr = 0
             self.low_cmd.mode_machine = self.mode_machine
 
+            # Waist joints
+            for i, joint_idx in enumerate(WAIST_JOINTS):
+                self.low_cmd.motor_cmd[joint_idx].mode = 1
+                self.low_cmd.motor_cmd[joint_idx].q = float(waist_target[i])
+                self.low_cmd.motor_cmd[joint_idx].dq = 0.0
+                self.low_cmd.motor_cmd[joint_idx].kp = WAIST_KP[joint_idx]
+                self.low_cmd.motor_cmd[joint_idx].kd = WAIST_KD[joint_idx]
+                self.low_cmd.motor_cmd[joint_idx].tau = 0.0
+
+            # Left arm joints
             for i, joint_idx in enumerate(LEFT_ARM_JOINTS):
                 self.low_cmd.motor_cmd[joint_idx].mode = 1
                 self.low_cmd.motor_cmd[joint_idx].q = float(left_target[i])
@@ -548,6 +620,7 @@ class G1PolicyDeployer:
                 self.low_cmd.motor_cmd[joint_idx].kd = ARM_KD[joint_idx]
                 self.low_cmd.motor_cmd[joint_idx].tau = 0.0
 
+            # Right arm joints
             for i, joint_idx in enumerate(RIGHT_ARM_JOINTS):
                 self.low_cmd.motor_cmd[joint_idx].mode = 1
                 self.low_cmd.motor_cmd[joint_idx].q = float(right_target[i])
