@@ -48,6 +48,9 @@ logs/
 *.pth
 *.onnx
 
+# Exception: allow checkpoints folder
+!checkpoints/*.pt
+
 # OS
 .DS_Store
 Thumbs.db
