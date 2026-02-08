@@ -316,7 +316,7 @@ class G1PolicyDeployer:
         # Policy
         self.policy = None
         self.obs_mean = None
-        self.obs_var = None
+        self.obs_std = None
         self.last_action = np.zeros(6)
 
         # Kinematics
@@ -352,8 +352,9 @@ class G1PolicyDeployer:
             state_dict = checkpoint
 
         # Print keys to understand structure
-        actor_keys = [k for k in state_dict.keys() if 'actor' in k.lower()]
-        print(f"Found actor keys: {actor_keys[:10]}...")
+        print("Checkpoint keys found:")
+        for k in sorted(state_dict.keys()):
+            print(f"  {k}")
 
         # Build MLP matching training config [256, 128, 64]
         # Input: 46D observations, Output: 6D actions
@@ -367,9 +368,8 @@ class G1PolicyDeployer:
             torch.nn.Linear(64, 6),
         )
 
-        # Try to load weights - adjust based on RSL-RL naming
+        # Load actor weights from RSL-RL checkpoint
         try:
-            # RSL-RL typically uses 'actor.0.weight', 'actor.0.bias', etc.
             new_state_dict = {}
             layer_map = {
                 'actor.0': '0',  # First linear
@@ -386,22 +386,25 @@ class G1PolicyDeployer:
                 self.policy.load_state_dict(new_state_dict)
                 print("Policy weights loaded successfully")
             else:
-                print("Warning: Could not map policy weights, using random initialization")
+                print("ERROR: Could not map policy weights!")
+                raise RuntimeError("Failed to load policy weights")
         except Exception as e:
-            print(f"Warning: Error loading weights: {e}")
-            print("Using random initialization - policy may not work correctly")
+            print(f"ERROR loading weights: {e}")
+            raise
 
-        # Load observation normalization
-        if 'obs_rms' in checkpoint:
-            self.obs_mean = checkpoint['obs_rms']['mean'].numpy()
-            self.obs_var = checkpoint['obs_rms']['var'].numpy()
-            print("Loaded observation normalization")
+        # Load observation normalization from RSL-RL checkpoint
+        # RSL-RL stores normalization in actor_obs_normalizer._mean and ._std
+        if 'actor_obs_normalizer._mean' in state_dict:
+            self.obs_mean = state_dict['actor_obs_normalizer._mean'].numpy().flatten()
+            self.obs_std = state_dict['actor_obs_normalizer._std'].numpy().flatten()
+            print(f"Loaded observation normalization (mean shape: {self.obs_mean.shape})")
         else:
+            print("WARNING: No observation normalization found, using defaults")
             self.obs_mean = np.zeros(46)
-            self.obs_var = np.ones(46)
-            print("Using default observation normalization")
+            self.obs_std = np.ones(46)
 
         self.policy.eval()
+        print("Policy ready for inference")
 
     def init_communication(self, network_interface: Optional[str] = None):
         """Initialize communication with the robot."""
@@ -505,7 +508,7 @@ class G1PolicyDeployer:
     def run_policy(self, obs: np.ndarray) -> np.ndarray:
         """Run policy inference to get actions."""
         # Normalize observation
-        obs_normalized = (obs - self.obs_mean) / np.sqrt(self.obs_var + 1e-8)
+        obs_normalized = (obs - self.obs_mean) / (self.obs_std + 1e-8)
 
         with torch.no_grad():
             obs_tensor = torch.FloatTensor(obs_normalized).unsqueeze(0)
@@ -588,6 +591,13 @@ class G1PolicyDeployer:
 
         left_default = np.array([DEFAULT_ARM_POSITIONS[i] for i in LEFT_ARM_JOINTS])
         right_default = np.array([DEFAULT_ARM_POSITIONS[i] for i in RIGHT_ARM_JOINTS])
+
+        # Debug: print starting and target positions
+        print(f"Left arm start:  {left_start}")
+        print(f"Left arm target: {left_default}")
+        print(f"Right arm start:  {right_start}")
+        print(f"Right arm target: {right_default}")
+        print(f"Waist start:  {waist_start}")
         waist_default = np.array([DEFAULT_WAIST_POSITIONS[i] for i in WAIST_JOINTS])
 
         while time.time() - start_time < duration:
@@ -686,7 +696,8 @@ class G1PolicyDeployer:
                         left_err = np.linalg.norm(self.left_target - left_ee)
                         right_err = np.linalg.norm(self.right_target - right_ee)
                         print(f"L_err: {left_err:.3f}m  R_err: {right_err:.3f}m  "
-                              f"L_target: {self.left_target}  R_target: {self.right_target}")
+                              f"Action: [{action[0]:.2f},{action[1]:.2f},{action[2]:.2f}|"
+                              f"{action[3]:.2f},{action[4]:.2f},{action[5]:.2f}]")
 
                     last_time = current_time
 
