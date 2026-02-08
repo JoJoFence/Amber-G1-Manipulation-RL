@@ -2,8 +2,8 @@
 G1 Upper Body Reach Task Environment Configuration for Isaac Lab 5.1.0
 
 Bimanual reaching task with:
-- Position-only IK control (3D per arm, no orientation tracking)
-- 4 DOF per arm (shoulder + elbow only, wrists held by PD)
+- Direct joint-space control (no IK) for sim-to-real transfer
+- 7 DOF per arm (shoulder + elbow + wrist)
 - Error-vector observations for clear arm-target association
 - EE velocity observations for learned deceleration
 - Multi-level tanh rewards for smooth approach without overshoot
@@ -27,8 +27,7 @@ from isaaclab.sensors import FrameTransformerCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
 from isaaclab.utils.configclass import configclass
-from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
-from isaaclab.envs.mdp.actions import DifferentialInverseKinematicsActionCfg
+from isaaclab.envs.mdp.actions import JointPositionActionCfg
 
 # Import MDP functions from Isaac Lab
 from . import mdp
@@ -135,45 +134,36 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP.
 
-    Position-only IK with shoulder + elbow joints only (4 DOF per arm).
-    Wrist joints are excluded from IK and held at neutral by their PD controllers.
-    Total action space: 6D (3D position delta per arm).
+    Direct joint-space control for all arm joints (7 DOF per arm).
+    Policy outputs joint position deltas, applied directly to joint targets.
+    Total action space: 14D (7 joints per arm × 2 arms).
+
+    This eliminates IK dependency for sim-to-real transfer - policy outputs
+    can be applied directly to the robot without any kinematic conversion.
     """
 
-    left_arm_action = DifferentialInverseKinematicsActionCfg(
+    arm_actions = JointPositionActionCfg(
         asset_name="robot",
         joint_names=[
+            # Left arm (7 joints)
             "left_shoulder_pitch_joint",
             "left_shoulder_roll_joint",
             "left_shoulder_yaw_joint",
             "left_elbow_joint",
-        ],
-        body_name=LEFT_EE_FRAME,
-        controller=DifferentialIKControllerCfg(
-            command_type="position",
-            use_relative_mode=True,
-            ik_method="dls",
-            ik_params={"lambda_val": 0.5},
-        ),
-        scale=0.03,  # Finer control for precision (max ~1.5 m/s EE velocity)
-    )
-
-    right_arm_action = DifferentialInverseKinematicsActionCfg(
-        asset_name="robot",
-        joint_names=[
+            "left_wrist_roll_joint",
+            "left_wrist_pitch_joint",
+            "left_wrist_yaw_joint",
+            # Right arm (7 joints)
             "right_shoulder_pitch_joint",
             "right_shoulder_roll_joint",
             "right_shoulder_yaw_joint",
             "right_elbow_joint",
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint",
         ],
-        body_name=RIGHT_EE_FRAME,
-        controller=DifferentialIKControllerCfg(
-            command_type="position",
-            use_relative_mode=True,
-            ik_method="dls",
-            ik_params={"lambda_val": 0.5},
-        ),
-        scale=0.03,
+        scale=0.05,  # Joint position delta scale (radians per action unit)
+        use_default_offset=True,  # Actions are relative to default joint positions
     )
 
 
@@ -185,14 +175,14 @@ class ObservationsCfg:
     eliminating the ambiguity that caused both arms to go to the same target.
     EE velocity enables learned deceleration to prevent overshoot.
 
-    Observation space (46D):
+    Observation space (54D):
     - joint_pos_rel: 14D (all joint positions relative to default)
     - joint_vel_rel: 14D (all joint velocities)
     - left_ee_error: 3D (vector from left EE to left target)
     - right_ee_error: 3D (vector from right EE to right target)
     - left_ee_vel: 3D (left EE linear velocity)
     - right_ee_vel: 3D (right EE linear velocity)
-    - last_action: 6D (previous action for consistency)
+    - last_action: 14D (previous action for temporal consistency)
     """
 
     @configclass
@@ -387,7 +377,7 @@ class RewardsCfg:
     )
 
     # Smooth actions - key for preventing overshoot
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1.0)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.5)
 
     # Light global joint velocity damping
     joint_vel_l2 = RewTerm(
@@ -401,6 +391,21 @@ class RewardsCfg:
         func=mdp.joint_acc_l2,
         weight=-0.002,
         params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+    # Wrist regularization - keep wrists near neutral during reaching
+    # Wrists should stay relatively neutral for reaching tasks
+    wrist_position_penalty = RewTerm(
+        func=mdp.wrist_position_penalty,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_wrist_.*"])},
+    )
+
+    # Wrist velocity penalty - discourage excessive wrist movement
+    wrist_velocity_penalty = RewTerm(
+        func=mdp.wrist_velocity_penalty,
+        weight=-0.3,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_wrist_.*"])},
     )
 
 

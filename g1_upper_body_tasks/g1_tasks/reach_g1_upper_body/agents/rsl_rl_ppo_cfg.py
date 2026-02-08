@@ -1,6 +1,7 @@
 """RSL-RL PPO configuration for G1 upper body reach task.
 
-Tuned for position-only IK with 6D action space and 46D observation space.
+Joint-space control with 14D action space (7 joints × 2 arms) and 54D observation space.
+No IK required - policy outputs joint position deltas directly for sim-to-real transfer.
 """
 
 from dataclasses import MISSING
@@ -35,11 +36,11 @@ class G1UpperReachPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         "critic": ["policy"],
     }
 
-    # Policy configuration
+    # Policy configuration - larger network for 14D joint-space control
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.3,  # Lower for smaller 6D action space
-        actor_hidden_dims=[256, 128, 64],
-        critic_hidden_dims=[256, 128, 64],
+        init_noise_std=0.5,  # Higher for larger 14D action space
+        actor_hidden_dims=[256, 256, 128],  # Wider network for joint coordination
+        critic_hidden_dims=[256, 256, 128],
         activation="elu",
         actor_obs_normalization=True,
         critic_obs_normalization=True,
