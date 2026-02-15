@@ -98,19 +98,20 @@ class CommandsCfg:
     """Command terms for the MDP."""
 
     # Target poses in BODY FRAME (relative to robot base at z=1.0)
-    # Workspace is conservative to ensure all targets are reachable
+    # Workspace tightened to stay within arm reach (~0.35m from shoulder).
+    # Shoulder is at (0.004, ±0.100, 0.238) in body frame; max arm reach ~0.41m.
     left_ee_pose = mdp.UniformPoseCommandCfg(
         asset_name="robot",
         body_name=LEFT_EE_FRAME,
         resampling_time_range=(4.0, 6.0),  # Longer hold for precision learning
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.20, 0.45),   # Forward reach (conservative max for reachability)
-            pos_y=(0.10, 0.30),   # Left side workspace (+Y is left)
-            pos_z=(-0.15, 0.15),  # Vertical range relative to base
-            roll=(0.0, 0.0),
-            pitch=(0.0, 0.0),
-            yaw=(0.0, 0.0),
+            pos_x=(0.15, 0.30),   # Forward reach (tightened from 0.20-0.45)
+            pos_y=(0.05, 0.22),   # Left side workspace (tightened from 0.10-0.30)
+            pos_z=(0.05, 0.25),   # Biased UP toward shoulder height (was -0.15 to 0.15)
+            roll=(-0.5, 0.5),     # ±29° (wrist roll limit is ±113°)
+            pitch=(-0.3, 0.3),    # ±17° (wrist pitch limit is ±92°)
+            yaw=(-0.5, 0.5),      # ±29° (wrist yaw limit is ±92°)
         ),
     )
 
@@ -120,12 +121,12 @@ class CommandsCfg:
         resampling_time_range=(4.0, 6.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.20, 0.45),   # Same forward range
-            pos_y=(-0.30, -0.10), # Right side workspace (symmetric, -Y is right)
-            pos_z=(-0.15, 0.15),  # Same vertical range
-            roll=(0.0, 0.0),
-            pitch=(0.0, 0.0),
-            yaw=(0.0, 0.0),
+            pos_x=(0.15, 0.30),   # Same forward range
+            pos_y=(-0.22, -0.05), # Right side workspace (symmetric)
+            pos_z=(0.05, 0.25),   # Same vertical range
+            roll=(-0.5, 0.5),     # ±29° (same as left)
+            pitch=(-0.3, 0.3),    # ±17°
+            yaw=(-0.5, 0.5),      # ±29°
         ),
     )
 
@@ -162,7 +163,7 @@ class ActionsCfg:
             "right_wrist_pitch_joint",
             "right_wrist_yaw_joint",
         ],
-        scale=0.05,  # Joint position delta scale (radians per action unit)
+        scale=0.03,  # Reduced from 0.05 to limit jitter amplitude
         use_default_offset=True,  # Actions are relative to default joint positions
     )
 
@@ -175,11 +176,13 @@ class ObservationsCfg:
     eliminating the ambiguity that caused both arms to go to the same target.
     EE velocity enables learned deceleration to prevent overshoot.
 
-    Observation space (54D):
+    Observation space (60D):
     - joint_pos_rel: 14D (all joint positions relative to default)
     - joint_vel_rel: 14D (all joint velocities)
     - left_ee_error: 3D (vector from left EE to left target)
     - right_ee_error: 3D (vector from right EE to right target)
+    - left_ee_orient_error: 3D (axis-angle orientation error for left EE)
+    - right_ee_orient_error: 3D (axis-angle orientation error for right EE)
     - left_ee_vel: 3D (left EE linear velocity)
     - right_ee_vel: 3D (right EE linear velocity)
     - last_action: 14D (previous action for temporal consistency)
@@ -210,6 +213,22 @@ class ObservationsCfg:
             },
         )
 
+        # Orientation error vectors: axis-angle representation (3D each)
+        left_ee_orient_error = ObsTerm(
+            func=mdp.ee_orientation_error,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
+                "command_name": "left_ee_pose",
+            },
+        )
+        right_ee_orient_error = ObsTerm(
+            func=mdp.ee_orientation_error,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
+                "command_name": "right_ee_pose",
+            },
+        )
+
         # EE velocities: enables learned deceleration near target
         left_ee_vel = ObsTerm(
             func=mdp.ee_velocity,
@@ -233,179 +252,159 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP.
+    """Reward terms for the MDP — Single-phase with all rewards active.
 
-    Simplified structure with multi-level tanh rewards (natural deceleration)
-    instead of exponential rewards (which caused overshoot due to increasing
-    gradient near target). No wrist penalties needed since wrists are excluded
-    from IK chain.
+    Position tracking + state-dependent anti-jitter + orientation rewards
+    all active from the start with calibrated weights.
     """
 
-    # === LEVEL 1: COARSE TRACKING (gradient at any distance) ===
+    # === BIMANUAL BALANCE (forces both arms to converge together) ===
+    # Returns min(left, right) so only improving the WORST arm earns reward.
+    # Prevents gradient imbalance from one arm converging first.
+    bimanual_pos_coarse = RewTerm(
+        func=mdp.bimanual_position_balance, weight=15.0,
+        params={
+            "left_asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
+            "right_asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
+            "left_command": "left_ee_pose", "right_command": "right_ee_pose", "std": 0.5,
+        },
+    )
+    bimanual_pos_fine = RewTerm(
+        func=mdp.bimanual_position_balance, weight=20.0,
+        params={
+            "left_asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
+            "right_asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
+            "left_command": "left_ee_pose", "right_command": "right_ee_pose", "std": 0.1,
+        },
+    )
+    bimanual_orient = RewTerm(
+        func=mdp.bimanual_orient_balance, weight=25.0,
+        params={
+            "left_asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
+            "right_asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
+            "left_command": "left_ee_pose", "right_command": "right_ee_pose", "std": 1.5,
+        },
+    )
+
+    # === POSITION TRACKING ===
     left_ee_coarse = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=2.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
-            "command_name": "left_ee_pose",
-            "std": 0.5,
-        },
+        func=mdp.position_command_error_tanh, weight=5.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "std": 0.5},
     )
-
     right_ee_coarse = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=2.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
-            "command_name": "right_ee_pose",
-            "std": 0.5,
-        },
+        func=mdp.position_command_error_tanh, weight=5.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "std": 0.5},
     )
-
-    # === LEVEL 2: MEDIUM TRACKING (main driver, gradient ~5-50cm) ===
     left_ee_medium = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=6.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
-            "command_name": "left_ee_pose",
-            "std": 0.25,
-        },
+        func=mdp.position_command_error_tanh, weight=6.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "std": 0.25},
     )
-
     right_ee_medium = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=6.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
-            "command_name": "right_ee_pose",
-            "std": 0.25,
-        },
+        func=mdp.position_command_error_tanh, weight=6.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "std": 0.25},
     )
-
-    # === LEVEL 3: FINE PRECISION (strong gradient within ~10cm) ===
     left_ee_fine = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=15.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
-            "command_name": "left_ee_pose",
-            "std": 0.1,
-        },
+        func=mdp.position_command_error_tanh, weight=8.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "std": 0.1},
     )
-
     right_ee_fine = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=15.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
-            "command_name": "right_ee_pose",
-            "std": 0.1,
-        },
+        func=mdp.position_command_error_tanh, weight=8.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "std": 0.1},
     )
 
-    # === HOLDING REWARD (reduce drift when close) ===
+    # === HOLDING + SUCCESS ===
     left_ee_holding = RewTerm(
-        func=mdp.position_holding_reward,
-        weight=10.0,  # Increased from 5.0
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
-            "command_name": "left_ee_pose",
-            "threshold": 0.04,  # Tightened from 5cm to 4cm
-        },
+        func=mdp.position_holding_reward, weight=5.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "threshold": 0.04},
     )
-
     right_ee_holding = RewTerm(
-        func=mdp.position_holding_reward,
-        weight=10.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
-            "command_name": "right_ee_pose",
-            "threshold": 0.04,
-        },
+        func=mdp.position_holding_reward, weight=5.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "threshold": 0.04},
     )
-
-    # === SUCCESS BONUS (sparse reward at target) ===
     left_ee_success = RewTerm(
-        func=mdp.position_command_success,
-        weight=15.0,  # Increased from 10.0
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
-            "command_name": "left_ee_pose",
-            "threshold": 0.03,  # 3cm success threshold
-        },
+        func=mdp.position_command_success, weight=8.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "threshold": 0.03},
     )
-
     right_ee_success = RewTerm(
-        func=mdp.position_command_success,
-        weight=15.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
-            "command_name": "right_ee_pose",
-            "threshold": 0.03,
-        },
+        func=mdp.position_command_success, weight=8.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "threshold": 0.03},
     )
 
-    # === ANTI-DRIFT: EE velocity penalty near target ===
+    # === EE VELOCITY NEAR TARGET ===
     left_ee_vel_near_target = RewTerm(
-        func=mdp.ee_velocity_penalty_near_target,
-        weight=-8.0,  # Strong penalty for moving when should be holding
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]),
-            "command_name": "left_ee_pose",
-            "threshold": 0.06,  # 6cm activation zone
-        },
+        func=mdp.ee_velocity_penalty_near_target, weight=-8.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "threshold": 0.06},
     )
-
     right_ee_vel_near_target = RewTerm(
-        func=mdp.ee_velocity_penalty_near_target,
-        weight=-8.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]),
-            "command_name": "right_ee_pose",
-            "threshold": 0.06,
-        },
+        func=mdp.ee_velocity_penalty_near_target, weight=-8.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "threshold": 0.06},
     )
 
     # === REGULARIZATION ===
-
-    # Prevent base tilt
     flat_orientation = RewTerm(
-        func=mdp.flat_orientation_l2,
-        weight=-1.0,
+        func=mdp.flat_orientation_l2, weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-
-    # Smooth actions - key for preventing overshoot
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.5)
-
-    # Light global joint velocity damping
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.2)
     joint_vel_l2 = RewTerm(
-        func=mdp.joint_vel_l2,
-        weight=-0.005,
+        func=mdp.joint_vel_l2, weight=-0.005,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-
-    # Light joint acceleration penalty
     joint_acc_l2 = RewTerm(
-        func=mdp.joint_acc_l2,
-        weight=-0.002,
+        func=mdp.joint_acc_l2, weight=-0.005,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
+    # wrist_position_penalty REMOVED — conflicts with orientation control.
+    # With randomized target orientations, wrists MUST deviate from zero.
+    # wrist_velocity_penalty REMOVED — same reason; wrists need to move for orientation.
 
-    # Wrist regularization - keep wrists near neutral during reaching
-    # Wrists should stay relatively neutral for reaching tasks
-    wrist_position_penalty = RewTerm(
-        func=mdp.wrist_position_penalty,
-        weight=-0.5,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_wrist_.*"])},
+    # === STATE-DEPENDENT REWARDS (active from start, gentle weights) ===
+    # action_start/action_end isolate each arm's 7 joints to prevent cross-arm interference.
+    # Action layout: left arm [0:7], right arm [7:14].
+
+    # Adaptive action rate: Gaussian proximity-scaled action jitter penalty
+    left_adaptive_action_rate = RewTerm(
+        func=mdp.adaptive_action_rate_penalty, weight=-0.2,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "sigma": 0.08, "action_start": 0, "action_end": 7},
+    )
+    right_adaptive_action_rate = RewTerm(
+        func=mdp.adaptive_action_rate_penalty, weight=-0.2,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "sigma": 0.08, "action_start": 7, "action_end": 14},
     )
 
-    # Wrist velocity penalty - discourage excessive wrist movement
-    wrist_velocity_penalty = RewTerm(
-        func=mdp.wrist_velocity_penalty,
-        weight=-0.3,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_wrist_.*"])},
+    # Terminal damping: positive reward for being still at target
+    left_terminal_damping = RewTerm(
+        func=mdp.terminal_damping_reward, weight=10.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "pos_sigma": 0.05, "action_start": 0, "action_end": 7},
+    )
+    right_terminal_damping = RewTerm(
+        func=mdp.terminal_damping_reward, weight=10.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "pos_sigma": 0.05, "action_start": 7, "action_end": 14},
+    )
+
+    # proximity_action_magnitude REMOVED — incompatible with orientation control.
+    # Penalizes ALL action magnitude near target, including wrist actions needed for orientation.
+    # At 1cm distance it produced -7.38 episode cost, overwhelming tracking and creating
+    # cross-arm interference through shared network gradients.
+
+    # === ORIENTATION TRACKING (always active — multi-level like position) ===
+    # Coarse: gradient for large errors (1-2 rad). std=1.5 so tanh doesn't saturate.
+    left_orient_coarse = RewTerm(
+        func=mdp.orientation_tracking_reward, weight=12.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "std": 1.5},
+    )
+    right_orient_coarse = RewTerm(
+        func=mdp.orientation_tracking_reward, weight=12.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "std": 1.5},
+    )
+    # Fine: strong gradient for sub-0.5 rad precision
+    left_orient_fine = RewTerm(
+        func=mdp.orientation_tracking_reward, weight=15.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[LEFT_EE_FRAME]), "command_name": "left_ee_pose", "std": 0.3},
+    )
+    right_orient_fine = RewTerm(
+        func=mdp.orientation_tracking_reward, weight=15.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=[RIGHT_EE_FRAME]), "command_name": "right_ee_pose", "std": 0.3},
     )
 
 

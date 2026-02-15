@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import RigidObject, Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import combine_frame_transforms, quat_error_magnitude, quat_mul
+from isaaclab.utils.math import combine_frame_transforms, quat_error_magnitude, quat_mul, quat_box_minus
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -313,3 +313,178 @@ def ee_velocity_penalty_near_target(
     activation = proximity * proximity  # Quadratic for smooth gradient
 
     return activation * vel_sq
+
+
+# === Helper for state-dependent rewards ===
+
+def _compute_ee_distance(env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Compute distance from EE to commanded target position. Returns (N,) tensor."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    des_pos_b = command[:, :3]
+    des_pos_w, _ = combine_frame_transforms(asset.data.root_pos_w, asset.data.root_quat_w, des_pos_b)
+    curr_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids[0]]
+    return torch.norm(curr_pos_w - des_pos_w, dim=1)
+
+
+# === State-Dependent Rewards for Curriculum Phase 2 ===
+
+
+def adaptive_action_rate_penalty(
+    env: ManagerBasedRLEnv, sigma: float, command_name: str, asset_cfg: SceneEntityCfg,
+    action_start: int = 0, action_end: int = 7,
+) -> torch.Tensor:
+    """Penalize action rate (change between timesteps) scaled by Gaussian proximity to target.
+
+    Near the target, action jitter is heavily penalized to prevent wobble.
+    Far from the target, the penalty is negligible so the policy can make big moves.
+
+    Only penalizes the arm's own action dimensions (action_start:action_end) to avoid
+    cross-arm interference where one arm's proximity suppresses the other arm's actions.
+    """
+    distance = _compute_ee_distance(env, command_name, asset_cfg)
+    proximity = torch.exp(-torch.square(distance / sigma))
+
+    # Action rate for THIS arm only
+    action = env.action_manager.action[:, action_start:action_end]
+    prev_action = env.action_manager.prev_action[:, action_start:action_end]
+    action_rate_sq = torch.sum(torch.square(action - prev_action), dim=1)
+
+    return proximity * action_rate_sq
+
+
+def terminal_damping_reward(
+    env: ManagerBasedRLEnv, pos_sigma: float, command_name: str, asset_cfg: SceneEntityCfg,
+    action_start: int = 0, action_end: int = 7,
+) -> torch.Tensor:
+    """Positive reward for being still at the target — the 'stop and hold' signal.
+
+    Combines two factors multiplicatively:
+    - Position closeness: exp(-(distance/pos_sigma)^2)
+    - Low EE velocity: exp(-||ee_vel|| * 10)
+
+    Note: Does NOT penalize action magnitude, since wrist actions are needed
+    for orientation control even when the position is on target.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    distance = _compute_ee_distance(env, command_name, asset_cfg)
+
+    # Position closeness (Gaussian)
+    pos_reward = torch.exp(-torch.square(distance / pos_sigma))
+
+    # Low EE velocity
+    ee_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids[0]]
+    vel_magnitude = torch.norm(ee_vel, dim=1)
+    vel_damping = torch.exp(-vel_magnitude * 10.0)
+
+    return pos_reward * vel_damping
+
+
+def proximity_action_magnitude_penalty(
+    env: ManagerBasedRLEnv, sigma: float, command_name: str, asset_cfg: SceneEntityCfg,
+    action_start: int = 0, action_end: int = 7,
+) -> torch.Tensor:
+    """Penalize action magnitude near target — the 'become deterministic' signal.
+
+    Near the target, the optimal policy should output near-zero actions (effectively
+    deterministic). Far from the target, large actions are acceptable for fast reaching.
+
+    Only penalizes THIS arm's action dimensions to avoid cross-arm interference.
+    """
+    distance = _compute_ee_distance(env, command_name, asset_cfg)
+    proximity = torch.exp(-torch.square(distance / sigma))
+
+    arm_action = env.action_manager.action[:, action_start:action_end]
+    action_sq = torch.sum(torch.square(arm_action), dim=1)
+
+    return proximity * action_sq
+
+
+def bimanual_position_balance(
+    env: ManagerBasedRLEnv, std: float,
+    left_command: str, right_command: str,
+    left_asset_cfg: SceneEntityCfg, right_asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Reward the WORSE arm's position tracking — forces balanced bimanual convergence.
+
+    Returns min(left_tracking, right_tracking) where tracking = 1 - tanh(distance/std).
+    The policy can only increase this reward by improving whichever arm is lagging.
+    This eliminates gradient imbalance from one arm converging first.
+    """
+    left_dist = _compute_ee_distance(env, left_command, left_asset_cfg)
+    right_dist = _compute_ee_distance(env, right_command, right_asset_cfg)
+    left_reward = 1 - torch.tanh(left_dist / std)
+    right_reward = 1 - torch.tanh(right_dist / std)
+    return torch.min(left_reward, right_reward)
+
+
+def bimanual_orient_balance(
+    env: ManagerBasedRLEnv, std: float,
+    left_command: str, right_command: str,
+    left_asset_cfg: SceneEntityCfg, right_asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Reward the WORSE arm's orientation tracking — forces balanced bimanual convergence."""
+    asset_left: Articulation = env.scene[left_asset_cfg.name]
+    asset_right: Articulation = env.scene[right_asset_cfg.name]
+
+    left_cmd = env.command_manager.get_command(left_command)
+    right_cmd = env.command_manager.get_command(right_command)
+
+    # Left orientation error
+    left_des_quat_w = quat_mul(asset_left.data.root_quat_w, left_cmd[:, 3:7])
+    left_curr_quat_w = asset_left.data.body_quat_w[:, left_asset_cfg.body_ids[0]]
+    left_err = quat_error_magnitude(left_curr_quat_w, left_des_quat_w)
+
+    # Right orientation error
+    right_des_quat_w = quat_mul(asset_right.data.root_quat_w, right_cmd[:, 3:7])
+    right_curr_quat_w = asset_right.data.body_quat_w[:, right_asset_cfg.body_ids[0]]
+    right_err = quat_error_magnitude(right_curr_quat_w, right_des_quat_w)
+
+    left_reward = 1 - torch.tanh(left_err / std)
+    right_reward = 1 - torch.tanh(right_err / std)
+    return torch.min(left_reward, right_reward)
+
+
+def orientation_tracking_reward(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """Reward orientation tracking using tanh kernel — always active, not proximity-scaled.
+
+    reward = 1 - tanh(orient_error / std)
+
+    Provides smooth gradient signal for orientation at ALL distances from target,
+    so the policy learns position and orientation simultaneously.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    des_quat_b = command[:, 3:7]
+    des_quat_w = quat_mul(asset.data.root_quat_w, des_quat_b)
+    curr_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]
+    orient_error = quat_error_magnitude(curr_quat_w, des_quat_w)
+    return 1 - torch.tanh(orient_error / std)
+
+
+def adaptive_orientation_penalty(
+    env: ManagerBasedRLEnv, sigma: float, command_name: str, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """Penalize orientation error scaled by position proximity to target.
+
+    Only cares about wrist alignment when the hand is close to the target position.
+    Far from target, the policy focuses purely on reaching; once close, it must also
+    align the wrist orientation.
+
+    proximity = exp(-(distance/sigma)^2)
+    penalty = proximity * quat_error_magnitude(current, desired)
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    distance = _compute_ee_distance(env, command_name, asset_cfg)
+    proximity = torch.exp(-torch.square(distance / sigma))
+
+    # Orientation error
+    des_quat_b = command[:, 3:7]
+    des_quat_w = quat_mul(asset.data.root_quat_w, des_quat_b)
+    curr_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]
+    orient_error = quat_error_magnitude(curr_quat_w, des_quat_w)
+
+    return proximity * orient_error

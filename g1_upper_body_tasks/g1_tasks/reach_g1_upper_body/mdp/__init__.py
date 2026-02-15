@@ -21,6 +21,7 @@ __all__ = [
     # Observations
     "ee_position_error",
     "ee_velocity",
+    "ee_orientation_error",
     # Rewards
     "flat_orientation_l2",
     "position_command_success",
@@ -33,4 +34,14 @@ __all__ = [
     "action_near_target_penalty",
     "joint_velocity_near_target_penalty",
     "ee_velocity_penalty_near_target",
+    "orientation_command_error",
+    "position_command_error",
+    # State-dependent rewards (Phase 2 curriculum)
+    "bimanual_position_balance",
+    "bimanual_orient_balance",
+    "orientation_tracking_reward",
+    "adaptive_action_rate_penalty",
+    "terminal_damping_reward",
+    "proximity_action_magnitude_penalty",
+    "adaptive_orientation_penalty",
 ]

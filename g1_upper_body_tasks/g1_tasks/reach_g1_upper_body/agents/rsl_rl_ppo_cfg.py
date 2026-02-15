@@ -19,9 +19,9 @@ class G1UpperReachPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """Configuration for RSL-RL PPO runner for G1 upper body reach."""
 
     num_steps_per_env = 64  # Longer rollouts for better value estimation
-    max_iterations = 5000
+    max_iterations = 10000
     save_interval = 200
-    experiment_name = "g1_upper_body_reach"
+    experiment_name = "g1_upper_body_reach_joint_space"
     empirical_normalization = True
 
     clip_obs = 100.0
@@ -39,8 +39,8 @@ class G1UpperReachPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # Policy configuration - larger network for 14D joint-space control
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=0.5,  # Higher for larger 14D action space
-        actor_hidden_dims=[256, 256, 128],  # Wider network for joint coordination
-        critic_hidden_dims=[256, 256, 128],
+        actor_hidden_dims=[512, 256, 256],  # Larger for 6D pose task with orientation
+        critic_hidden_dims=[512, 256, 256],
         activation="elu",
         actor_obs_normalization=True,
         critic_obs_normalization=True,

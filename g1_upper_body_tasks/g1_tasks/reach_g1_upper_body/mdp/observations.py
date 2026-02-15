@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import combine_frame_transforms
+from isaaclab.utils.math import combine_frame_transforms, quat_mul, quat_box_minus
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -73,3 +73,29 @@ def ee_velocity(
     """
     asset: Articulation = env.scene[asset_cfg.name]
     return asset.data.body_lin_vel_w[:, asset_cfg.body_ids[0]]
+
+
+def ee_orientation_error(
+    env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """3D orientation error vector (axis-angle) from current to desired EE orientation.
+
+    Uses the box-minus operator to compute the rotation difference as a 3D
+    axis-angle vector. The vector's direction is the rotation axis and its
+    magnitude is the rotation angle in radians.
+
+    Returns:
+        Tensor of shape (N, 3) with the orientation error as axis-angle.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+
+    # Target orientation: body frame -> world frame
+    des_quat_b = command[:, 3:7]
+    des_quat_w = quat_mul(asset.data.root_quat_w, des_quat_b)
+
+    # Current EE orientation in world frame
+    curr_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids[0]]
+
+    # Orientation error as axis-angle vector (3D)
+    return quat_box_minus(des_quat_w, curr_quat_w)
