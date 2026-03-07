@@ -417,13 +417,15 @@ class G1JointSpaceDeployer:
         return np.array([self.low_state.motor_state[i].dq for i in POLICY_JOINT_ORDER])
 
     def build_observation(self) -> np.ndarray:
-        """Build observation vector matching training format (54D).
+        """Build observation vector matching training format (60D).
 
         Observation space:
         - joint_pos_rel: 14D (joint positions relative to default)
         - joint_vel: 14D (joint velocities)
         - left_ee_error: 3D (target - EE position, approximate)
         - right_ee_error: 3D
+        - left_ee_orient_error: 3D (axis-angle orientation error, approximate)
+        - right_ee_orient_error: 3D
         - left_ee_vel: 3D (approximate from joint velocities)
         - right_ee_vel: 3D
         - last_action: 14D
@@ -441,18 +443,24 @@ class G1JointSpaceDeployer:
         left_ee_error = self.left_target - np.array([0.3, 0.2, 0.0])  # Approximate
         right_ee_error = self.right_target - np.array([0.3, -0.2, 0.0])
 
+        # Orientation errors (zeros = assume EE orientation matches target)
+        left_ee_orient_error = np.zeros(3)
+        right_ee_orient_error = np.zeros(3)
+
         # Approximate EE velocities (zeros for now, policy should be robust)
         left_ee_vel = np.zeros(3)
         right_ee_vel = np.zeros(3)
 
         obs = np.concatenate([
-            joint_pos_rel,    # 14D
-            joint_vel,        # 14D
-            left_ee_error,    # 3D
-            right_ee_error,   # 3D
-            left_ee_vel,      # 3D
-            right_ee_vel,     # 3D
-            self.last_action, # 14D
+            joint_pos_rel,          # 14D
+            joint_vel,              # 14D
+            left_ee_error,          # 3D
+            right_ee_error,         # 3D
+            left_ee_orient_error,   # 3D
+            right_ee_orient_error,  # 3D
+            left_ee_vel,            # 3D
+            right_ee_vel,           # 3D
+            self.last_action,       # 14D
         ])
 
         return obs
