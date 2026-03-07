@@ -126,11 +126,52 @@ WAIST_JOINTS = [
 ]
 DEFAULT_WAIST = np.array([0.0, 0.0, 0.0])
 
-# PD gains
-ARM_KP = np.array([60.0, 60.0, 40.0, 40.0, 30.0, 30.0, 30.0,  # Left
-                   60.0, 60.0, 40.0, 40.0, 30.0, 30.0, 30.0])  # Right
-ARM_KD = np.array([2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 1.0,  # Left
-                   2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 1.0])  # Right
+# Joint limits from URDF (per policy joint order)
+JOINT_LIMITS_LOW = np.array([
+    # Left arm
+    -3.0892,  # shoulder_pitch
+    -1.5882,  # shoulder_roll
+    -2.618,   # shoulder_yaw
+    -1.0472,  # elbow
+    -1.9722,  # wrist_roll
+    -1.6144,  # wrist_pitch
+    -1.6144,  # wrist_yaw
+    # Right arm
+    -3.0892,  # shoulder_pitch
+    -2.2515,  # shoulder_roll (flipped vs left)
+    -2.618,   # shoulder_yaw
+    -1.0472,  # elbow
+    -1.9722,  # wrist_roll
+    -1.6144,  # wrist_pitch
+    -1.6144,  # wrist_yaw
+])
+JOINT_LIMITS_HIGH = np.array([
+    # Left arm
+    2.6704,   # shoulder_pitch
+    2.2515,   # shoulder_roll
+    2.618,    # shoulder_yaw
+    2.0944,   # elbow
+    1.9722,   # wrist_roll
+    1.6144,   # wrist_pitch
+    1.6144,   # wrist_yaw
+    # Right arm
+    2.6704,   # shoulder_pitch
+    1.5882,   # shoulder_roll (flipped vs left)
+    2.618,    # shoulder_yaw
+    2.0944,   # elbow
+    1.9722,   # wrist_roll
+    1.6144,   # wrist_pitch
+    1.6144,   # wrist_yaw
+])
+
+# PD gains — closer to simulation values for proper tracking
+# Sim uses kp=300/kd=100 (shoulders/elbows) and kp=200/kd=80 (wrists).
+# On real hardware we use ~50% of sim gains as a safe starting point;
+# tune up if tracking is sluggish, down if there is oscillation.
+ARM_KP = np.array([150.0, 150.0, 150.0, 150.0, 100.0, 100.0, 100.0,  # Left
+                   150.0, 150.0, 150.0, 150.0, 100.0, 100.0, 100.0])  # Right
+ARM_KD = np.array([50.0, 50.0, 50.0, 50.0, 40.0, 40.0, 40.0,  # Left
+                   50.0, 50.0, 50.0, 50.0, 40.0, 40.0, 40.0])  # Right
 
 WAIST_KP = np.array([60.0, 40.0, 40.0])
 WAIST_KD = np.array([1.0, 1.0, 1.0])
@@ -234,7 +275,7 @@ class G1JointSpaceDeployer:
         self,
         checkpoint_path: str,
         control_freq: float = 50.0,
-        action_scale: float = 0.05,
+        action_scale: float = 0.03,
         mode: str = 'fixed',
     ):
         self.checkpoint_path = checkpoint_path
@@ -583,13 +624,14 @@ class G1JointSpaceDeployer:
                     action = self.run_policy(obs)
                     self.last_action = action
 
-                    # Apply action: joint position delta
-                    joint_delta = action * self.action_scale
-                    self.joint_targets = self.joint_targets + joint_delta
+                    # Apply action: offset from default pose (matches Isaac Lab
+                    # use_default_offset=True).  The policy outputs a normalised
+                    # action that is scaled and added to the default joint positions
+                    # each step — NOT accumulated on top of the previous target.
+                    self.joint_targets = DEFAULT_POSITIONS + action * self.action_scale
 
-                    # Clip to safe joint limits
-                    # TODO: Add proper joint limits from URDF
-                    self.joint_targets = np.clip(self.joint_targets, -2.0, 2.0)
+                    # Clip to safe joint limits (from URDF)
+                    self.joint_targets = np.clip(self.joint_targets, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)
 
                     # Send commands
                     self.send_joint_commands()
