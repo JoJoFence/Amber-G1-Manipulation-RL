@@ -23,6 +23,12 @@ import threading
 from pathlib import Path
 from typing import Optional, Tuple
 
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Import E-stop
+from estop import EStopMonitor, make_dampen_callback
+
 # Unitree SDK2 imports
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_, unitree_hg_msg_dds__LowState_
@@ -265,6 +271,9 @@ class G1JointSpaceDeployer:
 
         self.running = False
 
+        # E-stop
+        self.estop: Optional[EStopMonitor] = None
+
     def load_policy(self):
         """Load the trained policy from checkpoint."""
         print(f"Loading policy from {self.checkpoint_path}")
@@ -370,6 +379,34 @@ class G1JointSpaceDeployer:
 
     def _lowstate_callback(self, msg: LowState_):
         self.low_state = msg
+
+    def init_estop(self):
+        """Initialize the software emergency stop."""
+        # Build Kd lookup: index -> value
+        kd_lookup = {POLICY_JOINT_ORDER[i]: float(ARM_KD[i])
+                     for i in range(len(POLICY_JOINT_ORDER))}
+        waist_kd_lookup = {WAIST_JOINTS[i]: float(WAIST_KD[i])
+                           for i in range(len(WAIST_JOINTS))}
+
+        dampen_cb = make_dampen_callback(
+            low_cmd=self.low_cmd,
+            crc=self.crc,
+            lowcmd_publisher=self.lowcmd_publisher,
+            low_state_getter=lambda: self.low_state,
+            joint_indices=POLICY_JOINT_ORDER,
+            kd_values=kd_lookup,
+            waist_joints=WAIST_JOINTS,
+            waist_kd=waist_kd_lookup,
+            mode_machine_getter=lambda: self.mode_machine,
+        )
+
+        self.estop = EStopMonitor(
+            trigger_key=' ',
+            dampen_callback=dampen_cb,
+            hold_duration=3.0,
+            exit_after=True,
+        )
+        self.estop.start()
 
     def get_joint_positions(self) -> np.ndarray:
         """Get current joint positions in policy order."""
@@ -518,6 +555,11 @@ class G1JointSpaceDeployer:
 
         try:
             while self.running and (self.keyboard is None or self.keyboard.running):
+                # Check E-stop
+                if self.estop and self.estop.triggered:
+                    print("[E-STOP] Control loop halted.")
+                    break
+
                 current_time = time.time()
 
                 if current_time - last_time >= self.control_dt:
@@ -605,9 +647,14 @@ def main():
     if not args.skip_default_pose:
         deployer.move_to_default_pose(duration=3.0)
 
+    # Initialize E-stop (after communication is up, before control loop)
+    deployer.init_estop()
+
     try:
         deployer.run()
     finally:
+        if deployer.estop:
+            deployer.estop.stop()
         deployer.shutdown()
 
 
