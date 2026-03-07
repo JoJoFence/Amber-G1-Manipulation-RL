@@ -116,7 +116,7 @@ class MuJoCoPolicyVisualizer:
 
         # Control settings matching training
         self.decimation = 2  # Policy runs every 2 physics steps
-        self.action_scale = 0.05
+        self.action_scale = 0.03
 
     def load_policy(self, checkpoint_path: str):
         """Load trained policy from checkpoint."""
@@ -192,16 +192,18 @@ class MuJoCoPolicyVisualizer:
         return body_rot @ vel[3:6]  # rotate local linear velocity to world frame
 
     def build_observation(self) -> np.ndarray:
-        """Build observation vector matching training format (54D).
+        """Build observation vector matching training format (60D).
 
         Order matches reach_env_cfg.py ObservationsCfg.PolicyCfg:
         1. joint_pos_rel (14D) - joint positions relative to default
         2. joint_vel (14D) - joint velocities
         3. left_ee_error (3D) - target - ee_pos (world frame)
         4. right_ee_error (3D) - target - ee_pos (world frame)
-        5. left_ee_vel (3D) - EE linear velocity (world frame)
-        6. right_ee_vel (3D) - EE linear velocity (world frame)
-        7. last_action (14D) - previous action
+        5. left_ee_orient_error (3D) - axis-angle orientation error
+        6. right_ee_orient_error (3D) - axis-angle orientation error
+        7. left_ee_vel (3D) - EE linear velocity (world frame)
+        8. right_ee_vel (3D) - EE linear velocity (world frame)
+        9. last_action (14D) - previous action
         """
         joint_pos = self.get_joint_positions()
         joint_pos_rel = joint_pos - DEFAULT_POSITIONS
@@ -215,18 +217,24 @@ class MuJoCoPolicyVisualizer:
         left_ee_error = self.left_target - left_ee_pos
         right_ee_error = self.right_target - right_ee_pos
 
+        # Orientation errors (zeros — no orientation targets in MuJoCo viz)
+        left_ee_orient_error = np.zeros(3)
+        right_ee_orient_error = np.zeros(3)
+
         # EE velocities in world frame
         left_ee_vel = self.get_ee_velocity(self.left_ee_id)
         right_ee_vel = self.get_ee_velocity(self.right_ee_id)
 
         obs = np.concatenate([
-            joint_pos_rel,    # 14D
-            joint_vel,        # 14D
-            left_ee_error,    # 3D
-            right_ee_error,   # 3D
-            left_ee_vel,      # 3D
-            right_ee_vel,     # 3D
-            self.last_action, # 14D
+            joint_pos_rel,          # 14D
+            joint_vel,              # 14D
+            left_ee_error,          # 3D
+            right_ee_error,         # 3D
+            left_ee_orient_error,   # 3D
+            right_ee_orient_error,  # 3D
+            left_ee_vel,            # 3D
+            right_ee_vel,           # 3D
+            self.last_action,       # 14D
         ])
 
         return obs

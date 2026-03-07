@@ -170,6 +170,7 @@ pip install \
     scipy \
     pyyaml \
     tensorboard \
+    mujoco \
     -q
 success "Core dependencies installed"
 
