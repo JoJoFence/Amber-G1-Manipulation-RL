@@ -26,7 +26,8 @@ set -euo pipefail
 CONDA_ENV_NAME="jonas_g1_env"
 PYTHON_MIN_VERSION="3.10"
 UNITREE_SDK2_REPO="https://github.com/unitreerobotics/unitree_sdk2_python.git"
-UNITREE_SDK2_BRANCH="main"
+CYCLONEDDS_REPO="https://github.com/eclipse-cyclonedds/cyclonedds"
+CYCLONEDDS_BRANCH="releases/0.10.x"
 
 # --- Color helpers -----------------------------------------------------------
 RED='\033[0;31m'
@@ -182,12 +183,40 @@ if python -c "import unitree_sdk2py" 2>/dev/null; then
 else
     info "Installing unitree_sdk2py..."
 
-    # Clone and install
-    TEMP_SDK_DIR=$(mktemp -d)
-    trap "rm -rf $TEMP_SDK_DIR" EXIT
+    # Clone unitree_sdk2_python to home directory
+    SDK_DIR="$HOME/unitree_sdk2_python"
+    if [[ -d "$SDK_DIR" ]]; then
+        info "unitree_sdk2_python repo already cloned at $SDK_DIR"
+    else
+        git clone "$UNITREE_SDK2_REPO" "$SDK_DIR"
+    fi
 
-    git clone --depth 1 --branch "$UNITREE_SDK2_BRANCH" "$UNITREE_SDK2_REPO" "$TEMP_SDK_DIR/unitree_sdk2_python"
-    pip install "$TEMP_SDK_DIR/unitree_sdk2_python" -q
+    # Try installing; if cyclonedds is missing, build it first
+    if ! pip install -e "$SDK_DIR" -q 2>/dev/null; then
+        warn "Direct install failed (likely missing cyclonedds). Building cyclonedds..."
+
+        CYCLONE_DIR="$HOME/cyclonedds"
+        if [[ -d "$CYCLONE_DIR/install" ]]; then
+            info "cyclonedds already built at $CYCLONE_DIR/install"
+        else
+            if [[ -d "$CYCLONE_DIR" ]]; then
+                info "cyclonedds repo already cloned at $CYCLONE_DIR"
+            else
+                git clone "$CYCLONEDDS_REPO" -b "$CYCLONEDDS_BRANCH" "$CYCLONE_DIR"
+            fi
+
+            mkdir -p "$CYCLONE_DIR/build" "$CYCLONE_DIR/install"
+            cd "$CYCLONE_DIR/build"
+            cmake .. -DCMAKE_INSTALL_PREFIX="$CYCLONE_DIR/install"
+            cmake --build . --target install
+            cd "$SCRIPT_DIR"
+            success "cyclonedds built"
+        fi
+
+        export CYCLONEDDS_HOME="$CYCLONE_DIR/install"
+        info "Set CYCLONEDDS_HOME=$CYCLONEDDS_HOME"
+        pip install -e "$SDK_DIR" -q
+    fi
 
     # Verify
     if python -c "import unitree_sdk2py" 2>/dev/null; then
