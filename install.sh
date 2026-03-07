@@ -191,32 +191,31 @@ else
         git clone "$UNITREE_SDK2_REPO" "$SDK_DIR"
     fi
 
-    # Try installing; if cyclonedds is missing, build it first
-    if ! pip install -e "$SDK_DIR" -q 2>/dev/null; then
-        warn "Direct install failed (likely missing cyclonedds). Building cyclonedds..."
-
-        CYCLONE_DIR="$HOME/cyclonedds"
-        if [[ -d "$CYCLONE_DIR/install" ]]; then
-            info "cyclonedds already built at $CYCLONE_DIR/install"
+    # Build cyclonedds first (required dependency)
+    CYCLONE_DIR="$HOME/cyclonedds"
+    if [[ -d "$CYCLONE_DIR/install" ]]; then
+        info "cyclonedds already built at $CYCLONE_DIR/install"
+    else
+        info "Building cyclonedds..."
+        if [[ -d "$CYCLONE_DIR" ]]; then
+            info "cyclonedds repo already cloned at $CYCLONE_DIR"
         else
-            if [[ -d "$CYCLONE_DIR" ]]; then
-                info "cyclonedds repo already cloned at $CYCLONE_DIR"
-            else
-                git clone "$CYCLONEDDS_REPO" -b "$CYCLONEDDS_BRANCH" "$CYCLONE_DIR"
-            fi
-
-            mkdir -p "$CYCLONE_DIR/build" "$CYCLONE_DIR/install"
-            cd "$CYCLONE_DIR/build"
-            cmake .. -DCMAKE_INSTALL_PREFIX="$CYCLONE_DIR/install"
-            cmake --build . --target install
-            cd "$SCRIPT_DIR"
-            success "cyclonedds built"
+            git clone "$CYCLONEDDS_REPO" -b "$CYCLONEDDS_BRANCH" "$CYCLONE_DIR"
         fi
 
-        export CYCLONEDDS_HOME="$CYCLONE_DIR/install"
-        info "Set CYCLONEDDS_HOME=$CYCLONEDDS_HOME"
-        pip install -e "$SDK_DIR" -q
+        mkdir -p "$CYCLONE_DIR/build" "$CYCLONE_DIR/install"
+        cd "$CYCLONE_DIR/build"
+        cmake .. -DCMAKE_INSTALL_PREFIX="$CYCLONE_DIR/install"
+        cmake --build . --target install
+        cd "$SCRIPT_DIR"
+        success "cyclonedds built"
     fi
+
+    export CYCLONEDDS_HOME="$CYCLONE_DIR/install"
+    info "Set CYCLONEDDS_HOME=$CYCLONEDDS_HOME"
+
+    # Install unitree_sdk2_python into the active conda env
+    pip install -e "$SDK_DIR" -q
 
     # Verify
     if python -c "import unitree_sdk2py" 2>/dev/null; then
