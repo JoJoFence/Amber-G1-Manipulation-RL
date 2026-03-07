@@ -6,8 +6,8 @@
 # humanoid robot. Run this on the G1's onboard computer after cloning the repo.
 #
 # What this installs:
-#   - System dependencies (build tools, Python dev headers)
-#   - Python virtual environment with all runtime packages
+#   - System dependencies (build tools, dev headers)
+#   - Conda environment (jonas_g1_env) with all runtime packages
 #   - Unitree SDK2 Python bindings (robot communication)
 #   - PyTorch (CPU, for policy inference)
 #   - g1_tasks package (this repo)
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
-VENV_DIR=".venv"
+CONDA_ENV_NAME="jonas_g1_env"
 PYTHON_MIN_VERSION="3.10"
 UNITREE_SDK2_REPO="https://github.com/unitreerobotics/unitree_sdk2_python.git"
 UNITREE_SDK2_BRANCH="main"
@@ -81,27 +81,13 @@ fi
 source /etc/os-release
 info "Detected OS: $PRETTY_NAME"
 
-# Check Python
-PYTHON_CMD=""
-for cmd in python3.12 python3.11 python3.10 python3; do
-    if command -v "$cmd" &>/dev/null; then
-        PY_VER=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-        PY_MAJOR=$("$cmd" -c "import sys; print(sys.version_info.major)")
-        PY_MINOR=$("$cmd" -c "import sys; print(sys.version_info.minor)")
-        if [[ "$PY_MAJOR" -ge 3 ]] && [[ "$PY_MINOR" -ge 10 ]]; then
-            PYTHON_CMD="$cmd"
-            break
-        fi
-    fi
-done
-
-if [[ -z "$PYTHON_CMD" ]]; then
-    error "Python >= $PYTHON_MIN_VERSION not found."
-    error "Install it with: sudo apt install python3.10 python3.10-venv python3.10-dev"
+# Check conda
+if ! command -v conda &>/dev/null; then
+    error "conda not found. Please install Miniconda or Anaconda first."
+    error "See: https://docs.conda.io/en/latest/miniconda.html"
     exit 1
 fi
-
-info "Using Python: $PYTHON_CMD ($PY_VER)"
+info "Found conda: $(conda --version)"
 
 # --- Step 1: System dependencies --------------------------------------------
 echo ""
@@ -112,8 +98,6 @@ SYSTEM_PACKAGES=(
     cmake
     git
     curl
-    "python${PY_VER}-venv"
-    "python${PY_VER}-dev"
     libhdf5-dev
     libeigen3-dev
 )
@@ -134,23 +118,32 @@ else
     success "All system packages already installed"
 fi
 
-# --- Step 2: Python virtual environment --------------------------------------
+# --- Step 2: Conda environment -----------------------------------------------
 echo ""
-info "=== Step 2/5: Python virtual environment ==="
+info "=== Step 2/5: Conda environment ($CONDA_ENV_NAME) ==="
 
-if [[ -d "$VENV_DIR" ]]; then
-    warn "Virtual environment already exists at $VENV_DIR"
-    info "Reusing existing environment. Delete it and re-run to start fresh."
+# Initialize conda for this shell session
+eval "$(conda shell.bash hook)"
+
+if conda env list | grep -q "^${CONDA_ENV_NAME} "; then
+    info "Conda environment '$CONDA_ENV_NAME' already exists, activating..."
+    conda activate "$CONDA_ENV_NAME"
 else
-    info "Creating virtual environment..."
-    "$PYTHON_CMD" -m venv "$VENV_DIR"
-    success "Virtual environment created at $VENV_DIR"
+    info "Creating conda environment '$CONDA_ENV_NAME' with Python >= $PYTHON_MIN_VERSION..."
+    conda create -n "$CONDA_ENV_NAME" python=3.11 -y
+    conda activate "$CONDA_ENV_NAME"
+    success "Conda environment created"
 fi
 
-# Activate
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-info "Activated virtual environment"
+# Verify Python version
+PY_VER=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PY_MINOR=$(python -c "import sys; print(sys.version_info.minor)")
+if [[ "$PY_MINOR" -lt 10 ]]; then
+    error "Python in '$CONDA_ENV_NAME' is $PY_VER but >= $PYTHON_MIN_VERSION is required."
+    error "Recreate with: conda create -n $CONDA_ENV_NAME python=3.11 -y"
+    exit 1
+fi
+info "Using Python $PY_VER in conda env '$CONDA_ENV_NAME'"
 
 # Upgrade pip
 pip install --upgrade pip setuptools wheel -q
@@ -238,7 +231,7 @@ echo -e "  ${GREEN}Installation complete!${NC}"
 echo "============================================================"
 echo ""
 echo "  Activate the environment:"
-echo "    source $VENV_DIR/bin/activate"
+echo "    conda activate $CONDA_ENV_NAME"
 echo ""
 echo "  Test policy on real G1 (IK-based):"
 echo "    python g1_upper_body_tasks/scripts/deploy_g1_real.py \\"
