@@ -26,8 +26,9 @@ from typing import Optional, Tuple
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Import E-stop
+# Import E-stop and kinematics
 from estop import EStopMonitor, make_dampen_callback
+from g1_kinematics import G1ArmKinematics
 
 # Unitree SDK2 imports
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize
@@ -164,6 +165,12 @@ JOINT_LIMITS_HIGH = np.array([
     1.6144,   # wrist_yaw
 ])
 
+# Wrist joint indices (in POLICY_JOINT_ORDER / DEFAULT_POSITIONS order)
+WRIST_INDICES = [4, 5, 6, 11, 12, 13]
+# Clamp wrists to ±0.4 rad from default: without orientation feedback the policy
+# has no corrective signal for wrists and drives them to training-mean state.
+WRIST_CLAMP_DELTA = 0.4
+
 # PD gains — closer to simulation values for proper tracking
 # Sim uses kp=300/kd=100 (shoulders/elbows) and kp=200/kd=80 (wrists).
 # On real hardware we use ~50% of sim gains as a safe starting point;
@@ -294,7 +301,11 @@ class G1JointSpaceDeployer:
         self.policy = None
         self.obs_mean = None
         self.obs_std = None
-        self.last_action = np.zeros(14)
+        self.last_action = np.zeros(14)  # matches Isaac Lab episode-start reset
+
+        # Kinematics for EE position computation
+        self.left_kin = G1ArmKinematics('left')
+        self.right_kin = G1ArmKinematics('right')
 
         # Current joint targets (start at default)
         self.joint_targets = DEFAULT_POSITIONS.copy()
@@ -477,12 +488,11 @@ class G1JointSpaceDeployer:
         # Joint positions relative to default
         joint_pos_rel = joint_pos - DEFAULT_POSITIONS
 
-        # Approximate EE positions from joint angles (simplified)
-        # For a proper implementation, you'd use FK here
-        # We'll use placeholder values that the policy should handle
-        # since the error vectors are what matters most
-        left_ee_error = self.left_target - np.array([0.3, 0.2, 0.0])  # Approximate
-        right_ee_error = self.right_target - np.array([0.3, -0.2, 0.0])
+        # Compute EE positions via forward kinematics (body/torso frame)
+        left_ee_pos, _ = self.left_kin.forward_kinematics(joint_pos[0:7])
+        right_ee_pos, _ = self.right_kin.forward_kinematics(joint_pos[7:14])
+        left_ee_error = self.left_target - left_ee_pos
+        right_ee_error = self.right_target - right_ee_pos
 
         # Orientation errors (zeros = assume EE orientation matches target)
         left_ee_orient_error = np.zeros(3)
@@ -508,13 +518,17 @@ class G1JointSpaceDeployer:
 
     def run_policy(self, obs: np.ndarray) -> np.ndarray:
         """Run policy inference."""
-        obs_normalized = (obs - self.obs_mean) / (self.obs_std + 1e-8)
+        # Clip to ±5σ to prevent extreme OOD inputs at episode start
+        obs_normalized = np.clip((obs - self.obs_mean) / (self.obs_std + 1e-8), -5.0, 5.0)
 
         with torch.no_grad():
             obs_tensor = torch.FloatTensor(obs_normalized).unsqueeze(0)
             action = self.policy(obs_tensor).squeeze(0).numpy()
 
-        action = np.clip(action, -1.0, 1.0)
+        # Do NOT clip to ±1 — the policy raw output can legitimately reach ±20+
+        # (action_scale=0.03 means ±1 would limit joint targets to ±0.03 rad from default,
+        # far too narrow; the correct range is ±100 as a safety hard-stop only).
+        action = np.clip(action, -100.0, 100.0)
         return action
 
     def send_joint_commands(self):
@@ -629,6 +643,13 @@ class G1JointSpaceDeployer:
                     # action that is scaled and added to the default joint positions
                     # each step — NOT accumulated on top of the previous target.
                     self.joint_targets = DEFAULT_POSITIONS + action * self.action_scale
+
+                    # Clamp wrists: without orientation target feedback they drift
+                    self.joint_targets[WRIST_INDICES] = np.clip(
+                        self.joint_targets[WRIST_INDICES],
+                        DEFAULT_POSITIONS[WRIST_INDICES] - WRIST_CLAMP_DELTA,
+                        DEFAULT_POSITIONS[WRIST_INDICES] + WRIST_CLAMP_DELTA,
+                    )
 
                     # Clip to safe joint limits (from URDF)
                     self.joint_targets = np.clip(self.joint_targets, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)

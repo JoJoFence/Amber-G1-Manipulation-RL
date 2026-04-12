@@ -74,8 +74,19 @@ class MuJoCoPolicyVisualizer:
         self.model = mujoco.MjModel.from_xml_path(mjcf_path)
         self.data = mujoco.MjData(self.model)
 
-        # Set simulation timestep to match Isaac Lab (0.01s)
-        self.model.opt.timestep = 0.01
+        # Fix 1: disable floor — arms at default pose sit below z=0 and penetrate it.
+        floor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        if floor_id != -1:
+            self.model.geom_contype[floor_id] = 0
+            self.model.geom_conaffinity[floor_id] = 0
+            print("  Floor collision disabled (arms penetrate floor at default pose)")
+
+        # Fix 2: timestep + integrator for numerical stability.
+        # Isaac Lab uses PhysX implicit joint drives; explicit PD in MuJoCo is unstable
+        # for wrist_roll_joint (I_xx=5.48e-5 kg·m², kd=80 → kd*dt/I=2920 at dt=0.002).
+        # Solution: dt=0.0005 (explicit kp stable: kp*dt²/I=0.91) + implicitfast integrator.
+        self.model.opt.timestep = 0.0005
+        self.model.opt.integrator = 3  # mjINT_IMPLICITFAST
 
         # Map joint names to MuJoCo joint IDs and addresses
         self.joint_ids = []
@@ -99,24 +110,31 @@ class MuJoCoPolicyVisualizer:
         self.right_ee_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, RIGHT_EE_BODY)
         print(f"Left EE body ID: {self.left_ee_id}, Right EE body ID: {self.right_ee_id}")
 
+        # Set kd as joint damping (implicit → unconditionally stable).
+        # The explicit apply_pd_control will only apply the kp term.
+        for i, dof_addr in enumerate(self.qvel_addrs):
+            self.model.dof_damping[dof_addr] = PD_KD[i]
+
         # Load policy
         self.load_policy(checkpoint_path)
 
-        # State
-        self.last_action = np.zeros(14)
+        # State — warm-start last_action to training mean (set after load_policy populates obs_mean)
         self.joint_targets = DEFAULT_POSITIONS.copy()
 
-        # Targets for reaching
-        self.left_target = np.array([0.35, 0.20, 0.0])
-        self.right_target = np.array([0.35, -0.20, 0.0])
+        # Targets for reaching — body frame coords (= MuJoCo world frame since root is at origin)
+        # Must stay within tightened workspace: x=[0.15,0.30], y=[±0.05,±0.22], z=[0.05,0.25]
+        self.left_target = np.array([0.25, 0.15, 0.15])
+        self.right_target = np.array([0.25, -0.15, 0.15])
 
         # Target resampling
         self.target_resample_time = 5.0
         self.last_resample = 0.0
 
         # Control settings matching training
-        self.decimation = 2  # Policy runs every 2 physics steps
+        self.decimation = 40  # dt=0.0005 × 40 = 0.02s = 50Hz policy rate
         self.action_scale = 0.03
+        self.wrist_indices = [4, 5, 6, 11, 12, 13]
+        self.wrist_clamp_delta = 0.4  # rad; prevents wrist runaway without orientation feedback
 
     def load_policy(self, checkpoint_path: str):
         """Load trained policy from checkpoint."""
@@ -166,6 +184,9 @@ class MuJoCoPolicyVisualizer:
 
         self.policy.eval()
         print("Policy loaded successfully")
+
+        # last_action=0 matches Isaac Lab's episode-start reset (action_manager zeros it).
+        self.last_action = np.zeros(14)
 
     def get_joint_positions(self) -> np.ndarray:
         """Get current joint positions using proper qpos addresses."""
@@ -241,7 +262,7 @@ class MuJoCoPolicyVisualizer:
 
     def run_policy(self, obs: np.ndarray) -> np.ndarray:
         """Run policy inference."""
-        obs_normalized = (obs - self.obs_mean) / (self.obs_std + 1e-8)
+        obs_normalized = np.clip((obs - self.obs_mean) / (self.obs_std + 1e-8), -5.0, 5.0)
 
         with torch.no_grad():
             obs_tensor = torch.FloatTensor(obs_normalized).unsqueeze(0)
@@ -250,31 +271,36 @@ class MuJoCoPolicyVisualizer:
         return np.clip(action, -100.0, 100.0)
 
     def apply_pd_control(self, targets: np.ndarray):
-        """Apply PD control torques matching Isaac Lab's ImplicitActuator.
+        """Apply position feedback torques (kp term only).
 
-        Computes: torque = kp * (target - qpos) - kd * qvel
-        Clips to effort limits matching the training config.
+        kd (velocity damping) is handled implicitly via model.dof_damping set in __init__,
+        which is unconditionally stable in MuJoCo's implicitfast integrator.
+        Applying kd explicitly as well would cause kd*dt/I >> 2 instability for wrist_roll.
         """
         joint_pos = self.get_joint_positions()
-        joint_vel = self.get_joint_velocities()
-
-        torques = PD_KP * (targets - joint_pos) - PD_KD * joint_vel
+        torques = PD_KP * (targets - joint_pos)
         torques = np.clip(torques, -EFFORT_LIMIT, EFFORT_LIMIT)
 
         for i, aid in enumerate(self.actuator_ids):
             self.data.ctrl[aid] = torques[i]
 
     def randomize_targets(self):
-        """Generate random reachable targets matching training command ranges."""
+        """Generate random reachable targets matching training command ranges.
+
+        Bounds match reach_env_cfg.py CommandsCfg (tightened workspace):
+          x: [0.15, 0.30]  — forward reach
+          y: [0.05, 0.22]  — left arm, [-0.22, -0.05] right arm
+          z: [0.05, 0.25]  — above root height (all within 0.36m of shoulder)
+        """
         self.left_target = np.array([
-            np.random.uniform(0.20, 0.45),
-            np.random.uniform(0.10, 0.30),
-            np.random.uniform(-0.15, 0.15),
+            np.random.uniform(0.15, 0.30),
+            np.random.uniform(0.05, 0.22),
+            np.random.uniform(0.05, 0.25),
         ])
         self.right_target = np.array([
-            np.random.uniform(0.20, 0.45),
-            np.random.uniform(-0.30, -0.10),
-            np.random.uniform(-0.15, 0.15),
+            np.random.uniform(0.15, 0.30),
+            np.random.uniform(-0.22, -0.05),
+            np.random.uniform(0.05, 0.25),
         ])
 
     def run(self):
@@ -296,8 +322,8 @@ class MuJoCoPolicyVisualizer:
         self.apply_pd_control(self.joint_targets)
         mujoco.mj_forward(self.model, self.data)
 
-        # Let the PD controller settle for a moment
-        for _ in range(100):
+        # Let the PD controller settle (1000 × 0.0005s = 0.5s)
+        for _ in range(1000):
             self.apply_pd_control(self.joint_targets)
             mujoco.mj_step(self.model, self.data)
 
@@ -307,9 +333,10 @@ class MuJoCoPolicyVisualizer:
         print(f"Initial left EE:  {left_ee.round(4)}")
         print(f"Initial right EE: {right_ee.round(4)}")
 
-        # Set initial targets near default EE positions
-        self.left_target = left_ee + np.array([0.05, 0.0, 0.05])
-        self.right_target = right_ee + np.array([0.05, 0.0, 0.05])
+        # Use fixed initial targets within the tightened workspace
+        # (body frame = world frame in this model since root is at origin)
+        self.left_target = np.array([0.25, 0.15, 0.15])
+        self.right_target = np.array([0.25, -0.15, 0.15])
         print(f"Initial left target:  {self.left_target.round(4)}")
         print(f"Initial right target: {self.right_target.round(4)}")
 
@@ -335,6 +362,13 @@ class MuJoCoPolicyVisualizer:
 
                 # Compute joint position targets
                 self.joint_targets = DEFAULT_POSITIONS + action * self.action_scale
+                # Clamp wrists: without orientation feedback they drift to joint limits
+                wi = self.wrist_indices
+                self.joint_targets[wi] = np.clip(
+                    self.joint_targets[wi],
+                    DEFAULT_POSITIONS[wi] - self.wrist_clamp_delta,
+                    DEFAULT_POSITIONS[wi] + self.wrist_clamp_delta,
+                )
 
                 # Run physics with PD control for `decimation` substeps
                 for _ in range(self.decimation):
