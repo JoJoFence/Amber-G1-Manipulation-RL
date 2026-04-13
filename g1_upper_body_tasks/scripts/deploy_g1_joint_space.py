@@ -127,42 +127,59 @@ WAIST_JOINTS = [
 ]
 DEFAULT_WAIST = np.array([0.0, 0.0, 0.0])
 
-# Joint limits from URDF (per policy joint order)
+# URDF hard limits (absolute safety floor — never exceed these)
 JOINT_LIMITS_LOW = np.array([
-    # Left arm
-    -3.0892,  # shoulder_pitch
-    -1.5882,  # shoulder_roll
-    -2.618,   # shoulder_yaw
-    -1.0472,  # elbow
-    -1.9722,  # wrist_roll
-    -1.6144,  # wrist_pitch
-    -1.6144,  # wrist_yaw
-    # Right arm
-    -3.0892,  # shoulder_pitch
-    -2.2515,  # shoulder_roll (flipped vs left)
-    -2.618,   # shoulder_yaw
-    -1.0472,  # elbow
-    -1.9722,  # wrist_roll
-    -1.6144,  # wrist_pitch
-    -1.6144,  # wrist_yaw
+    -3.0892, -1.5882, -2.618, -1.0472, -1.9722, -1.6144, -1.6144,  # left
+    -3.0892, -2.2515, -2.618, -1.0472, -1.9722, -1.6144, -1.6144,  # right
 ])
 JOINT_LIMITS_HIGH = np.array([
+    2.6704, 2.2515, 2.618, 2.0944, 1.9722, 1.6144, 1.6144,   # left
+    2.6704, 1.5882, 2.618, 2.0944, 1.9722, 1.6144, 1.6144,   # right
+])
+
+# Operational limits — tighter than URDF to prevent self-collision.
+# Key constraints:
+#   shoulder_roll: default=±0.3 (outward).  Allowing it to go far negative (left)
+#     or far positive (right) rotates the arm inward until the elbow hits the torso.
+#     Restrict inward travel to ~0.2 rad past default.
+#   elbow: negative values hyperextend the arm; keep ≥ 0.1 rad to maintain a safe bend.
+#   Wrists: already handled by WRIST_CLAMP_DELTA; kept tight here too for consistency.
+# These are a safe starting point — loosen specific joints if the workspace is insufficient.
+OPERATIONAL_LIMITS_LOW = np.array([
     # Left arm
-    2.6704,   # shoulder_pitch
-    2.2515,   # shoulder_roll
-    2.618,    # shoulder_yaw
-    2.0944,   # elbow
-    1.9722,   # wrist_roll
-    1.6144,   # wrist_pitch
-    1.6144,   # wrist_yaw
+    -1.5,   # shoulder_pitch  (URDF: -3.09)
+    -0.2,   # shoulder_roll   (default +0.3; this allows ~0.5 rad inward before torso contact)
+    -1.5,   # shoulder_yaw    (URDF: -2.62)
+     0.1,   # elbow           (URDF: -1.05; prevent hyperextension)
+    -0.4,   # wrist_roll
+    -0.3,   # wrist_pitch
+    -0.4,   # wrist_yaw
+    # Right arm (roll sign is flipped: negative = outward, positive = inward)
+    -1.5,   # shoulder_pitch
+    -1.5,   # shoulder_roll   (URDF: -2.25; negative is outward for right arm — no restriction)
+    -1.5,   # shoulder_yaw
+     0.1,   # elbow
+    -0.4,   # wrist_roll
+    -0.3,   # wrist_pitch
+    -0.4,   # wrist_yaw
+])
+OPERATIONAL_LIMITS_HIGH = np.array([
+    # Left arm
+     2.0,   # shoulder_pitch  (URDF: 2.67)
+     1.8,   # shoulder_roll   (URDF: 2.25)
+     1.5,   # shoulder_yaw    (URDF: 2.62)
+     2.0,   # elbow           (URDF: 2.09)
+     0.4,   # wrist_roll
+     0.3,   # wrist_pitch
+     0.4,   # wrist_yaw
     # Right arm
-    2.6704,   # shoulder_pitch
-    1.5882,   # shoulder_roll (flipped vs left)
-    2.618,    # shoulder_yaw
-    2.0944,   # elbow
-    1.9722,   # wrist_roll
-    1.6144,   # wrist_pitch
-    1.6144,   # wrist_yaw
+     2.0,   # shoulder_pitch
+     0.2,   # shoulder_roll   (default -0.3; this allows ~0.5 rad inward before torso contact)
+     1.5,   # shoulder_yaw
+     2.0,   # elbow
+     0.4,   # wrist_roll
+     0.3,   # wrist_pitch
+     0.4,   # wrist_yaw
 ])
 
 # Wrist joint indices (in POLICY_JOINT_ORDER / DEFAULT_POSITIONS order)
@@ -193,7 +210,7 @@ MAX_JOINT_DELTA = 0.01  # rad per 20 ms step  (0.5 rad/s)
 # Exponential moving average factor for policy actions.
 # Prevents high-frequency oscillation from OOD policy outputs.
 # Lower = more smoothing, slower response.  0.2 gives ~90ms time constant.
-ACTION_SMOOTH_ALPHA = 0.2
+ACTION_SMOOTH_ALPHA = 0.15
 
 WAIST_KP = np.array([60.0, 40.0, 40.0])
 WAIST_KD = np.array([1.0, 1.0, 1.0])
@@ -671,8 +688,8 @@ class G1JointSpaceDeployer:
                         DEFAULT_POSITIONS[WRIST_INDICES] + WRIST_CLAMP_DELTA,
                     )
 
-                    # Clip to safe joint limits (from URDF)
-                    desired_targets = np.clip(desired_targets, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)
+                    # Clip to operational limits (tighter than URDF, prevents self-collision)
+                    desired_targets = np.clip(desired_targets, OPERATIONAL_LIMITS_LOW, OPERATIONAL_LIMITS_HIGH)
 
                     # Rate-limit: cap change per step to MAX_JOINT_DELTA.
                     delta = np.clip(
