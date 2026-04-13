@@ -186,9 +186,14 @@ ARM_KD = np.array([5.0,  5.0,  5.0,  5.0,  3.0,  3.0,  3.0,    # Left
                    5.0,  5.0,  5.0,  5.0,  3.0,  3.0,  3.0])    # Right
 
 # Maximum joint position change per control step (= max velocity at 50 Hz).
-# 0.04 rad/step = 2 rad/s.  This caps all target jumps — including the large
-# actions produced during the policy's OOD warm-up — to a safe slew rate.
-MAX_JOINT_DELTA = 0.04  # rad per 20 ms step
+# 0.02 rad/step = 1 rad/s.  Conservative starting point — tune up only after
+# confirming smooth motion.  This is the primary safety guard against OOD transients.
+MAX_JOINT_DELTA = 0.02  # rad per 20 ms step
+
+# Exponential moving average factor for policy actions.
+# Prevents high-frequency oscillation from OOD policy outputs.
+# Lower = more smoothing, slower response.  0.3 gives ~60ms time constant.
+ACTION_SMOOTH_ALPHA = 0.3
 
 WAIST_KP = np.array([60.0, 40.0, 40.0])
 WAIST_KD = np.array([1.0, 1.0, 1.0])
@@ -311,7 +316,8 @@ class G1JointSpaceDeployer:
         self.policy = None
         self.obs_mean = None
         self.obs_std = None
-        self.last_action = np.zeros(14)  # matches Isaac Lab episode-start reset
+        self.last_action = np.zeros(14)    # matches Isaac Lab episode-start reset
+        self.smoothed_action = np.zeros(14)  # EMA-filtered policy output
 
         # Kinematics for EE position computation
         self.left_kin = G1ArmKinematics('left')
@@ -613,6 +619,8 @@ class G1JointSpaceDeployer:
 
         self.joint_targets = DEFAULT_POSITIONS.copy()
         self.joint_velocities = np.zeros(14)
+        self.smoothed_action = np.zeros(14)
+        self.last_action = np.zeros(14)
         print("Default pose reached")
 
     def run(self):
@@ -646,12 +654,15 @@ class G1JointSpaceDeployer:
                     # Build observation
                     obs = self.build_observation()
 
-                    # Run policy
-                    action = self.run_policy(obs)
-                    self.last_action = action
+                    # Run policy and apply EMA smoothing.
+                    # Without smoothing, OOD outputs oscillate between large +/− values
+                    # each step; the EMA low-passes these to a stable moving average.
+                    raw_action = self.run_policy(obs)
+                    self.smoothed_action = (ACTION_SMOOTH_ALPHA * raw_action
+                                            + (1.0 - ACTION_SMOOTH_ALPHA) * self.smoothed_action)
 
-                    # Compute desired targets from policy (offset from default)
-                    desired_targets = DEFAULT_POSITIONS + action * self.action_scale
+                    # Compute desired targets from smoothed action (offset from default)
+                    desired_targets = DEFAULT_POSITIONS + self.smoothed_action * self.action_scale
 
                     # Clamp wrists: without orientation target feedback they drift
                     desired_targets[WRIST_INDICES] = np.clip(
@@ -664,8 +675,6 @@ class G1JointSpaceDeployer:
                     desired_targets = np.clip(desired_targets, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)
 
                     # Rate-limit: cap change per step to MAX_JOINT_DELTA.
-                    # This prevents the OOD transient (and any future large actions)
-                    # from producing target jumps that cause grinding.
                     delta = np.clip(
                         desired_targets - self.joint_targets,
                         -MAX_JOINT_DELTA, MAX_JOINT_DELTA,
@@ -673,6 +682,12 @@ class G1JointSpaceDeployer:
                     self.joint_targets = self.joint_targets + delta
                     # Feedforward velocity = how fast we're actually moving the target
                     self.joint_velocities = delta / self.control_dt
+
+                    # Feed back the ACHIEVED action (from rate-limited targets), not the
+                    # raw policy output.  If last_action=raw (e.g. 30) but joints only
+                    # moved 0.02 rad, the policy sees a huge inconsistency next step and
+                    # overcorrects → oscillation.
+                    self.last_action = (self.joint_targets - DEFAULT_POSITIONS) / self.action_scale
 
                     # Send commands
                     self.send_joint_commands()
@@ -694,7 +709,8 @@ class G1JointSpaceDeployer:
 
         finally:
             self.running = False
-            self.joint_velocities = np.zeros(14)  # clear feedforward before handoff
+            self.joint_velocities = np.zeros(14)
+            self.smoothed_action = np.zeros(14)
             if self.keyboard:
                 self.keyboard.stop()
 
