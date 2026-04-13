@@ -188,12 +188,12 @@ ARM_KD = np.array([5.0,  5.0,  5.0,  5.0,  3.0,  3.0,  3.0,    # Left
 # Maximum joint position change per control step (= max velocity at 50 Hz).
 # 0.02 rad/step = 1 rad/s.  Conservative starting point — tune up only after
 # confirming smooth motion.  This is the primary safety guard against OOD transients.
-MAX_JOINT_DELTA = 0.02  # rad per 20 ms step
+MAX_JOINT_DELTA = 0.01  # rad per 20 ms step  (0.5 rad/s)
 
 # Exponential moving average factor for policy actions.
 # Prevents high-frequency oscillation from OOD policy outputs.
-# Lower = more smoothing, slower response.  0.3 gives ~60ms time constant.
-ACTION_SMOOTH_ALPHA = 0.3
+# Lower = more smoothing, slower response.  0.2 gives ~90ms time constant.
+ACTION_SMOOTH_ALPHA = 0.2
 
 WAIST_KP = np.array([60.0, 40.0, 40.0])
 WAIST_KD = np.array([1.0, 1.0, 1.0])
@@ -698,7 +698,8 @@ class G1JointSpaceDeployer:
                         joint_pos = self.get_joint_positions()
                         print(f"Joints L[0:4]: {joint_pos[:4].round(2)}  "
                               f"R[0:4]: {joint_pos[7:11].round(2)}  "
-                              f"Action max: {np.abs(action).max():.2f}")
+                              f"Action max: {np.abs(raw_action).max():.2f}  "
+                          f"Smoothed max: {np.abs(self.smoothed_action).max():.2f}")
 
                     last_time = current_time
 
