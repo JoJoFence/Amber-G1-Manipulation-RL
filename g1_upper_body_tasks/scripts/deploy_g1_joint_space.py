@@ -171,14 +171,24 @@ WRIST_INDICES = [4, 5, 6, 11, 12, 13]
 # has no corrective signal for wrists and drives them to training-mean state.
 WRIST_CLAMP_DELTA = 0.4
 
-# PD gains — closer to simulation values for proper tracking
-# Sim uses kp=300/kd=100 (shoulders/elbows) and kp=200/kd=80 (wrists).
-# On real hardware we use ~50% of sim gains as a safe starting point;
-# tune up if tracking is sluggish, down if there is oscillation.
-ARM_KP = np.array([150.0, 150.0, 150.0, 150.0, 100.0, 100.0, 100.0,  # Left
-                   150.0, 150.0, 150.0, 150.0, 100.0, 100.0, 100.0])  # Right
-ARM_KD = np.array([50.0, 50.0, 50.0, 50.0, 40.0, 40.0, 40.0,  # Left
-                   50.0, 50.0, 50.0, 50.0, 40.0, 40.0, 40.0])  # Right
+# PD gains for real hardware.
+#
+# KD WARNING: kd on real hardware acts at the control loop rate (50 Hz = 20 ms period).
+# kd=50 means a joint moving at 1 rad/s produces 50 Nm of braking — the G1 shoulder
+# effort limit is 25 Nm, so kd=50 is already saturating at moderate speeds.
+# During the initial OOD transient the policy requests ~0.5 rad/step which the
+# hardware interprets as 25 rad/s → 1250 Nm opposing torque → grinding.
+# Keep kd ≤ 5 for shoulders, ≤ 3 for wrists.  The rate limiter below (MAX_JOINT_DELTA)
+# provides the primary motion smoothing; kd handles fine-grained velocity damping only.
+ARM_KP = np.array([80.0, 80.0, 80.0, 80.0, 40.0, 40.0, 40.0,   # Left
+                   80.0, 80.0, 80.0, 80.0, 40.0, 40.0, 40.0])   # Right
+ARM_KD = np.array([5.0,  5.0,  5.0,  5.0,  3.0,  3.0,  3.0,    # Left
+                   5.0,  5.0,  5.0,  5.0,  3.0,  3.0,  3.0])    # Right
+
+# Maximum joint position change per control step (= max velocity at 50 Hz).
+# 0.04 rad/step = 2 rad/s.  This caps all target jumps — including the large
+# actions produced during the policy's OOD warm-up — to a safe slew rate.
+MAX_JOINT_DELTA = 0.04  # rad per 20 ms step
 
 WAIST_KP = np.array([60.0, 40.0, 40.0])
 WAIST_KD = np.array([1.0, 1.0, 1.0])
@@ -307,8 +317,9 @@ class G1JointSpaceDeployer:
         self.left_kin = G1ArmKinematics('left')
         self.right_kin = G1ArmKinematics('right')
 
-        # Current joint targets (start at default)
+        # Current joint targets and feedforward velocities (start at default / zero)
         self.joint_targets = DEFAULT_POSITIONS.copy()
+        self.joint_velocities = np.zeros(14)  # feedforward dq sent with each command
 
         # EE targets for observations (body frame)
         self.base_left_target = np.array([0.35, 0.20, 0.0])
@@ -545,11 +556,11 @@ class G1JointSpaceDeployer:
             self.low_cmd.motor_cmd[joint_idx].kd = float(WAIST_KD[i])
             self.low_cmd.motor_cmd[joint_idx].tau = 0.0
 
-        # Arm joints
+        # Arm joints — feedforward velocity (dq) reduces position-error torque during motion
         for i, joint_idx in enumerate(POLICY_JOINT_ORDER):
             self.low_cmd.motor_cmd[joint_idx].mode = 1
             self.low_cmd.motor_cmd[joint_idx].q = float(self.joint_targets[i])
-            self.low_cmd.motor_cmd[joint_idx].dq = 0.0
+            self.low_cmd.motor_cmd[joint_idx].dq = float(self.joint_velocities[i])
             self.low_cmd.motor_cmd[joint_idx].kp = float(ARM_KP[i])
             self.low_cmd.motor_cmd[joint_idx].kd = float(ARM_KD[i])
             self.low_cmd.motor_cmd[joint_idx].tau = 0.0
@@ -601,6 +612,7 @@ class G1JointSpaceDeployer:
             time.sleep(0.002)
 
         self.joint_targets = DEFAULT_POSITIONS.copy()
+        self.joint_velocities = np.zeros(14)
         print("Default pose reached")
 
     def run(self):
@@ -638,21 +650,29 @@ class G1JointSpaceDeployer:
                     action = self.run_policy(obs)
                     self.last_action = action
 
-                    # Apply action: offset from default pose (matches Isaac Lab
-                    # use_default_offset=True).  The policy outputs a normalised
-                    # action that is scaled and added to the default joint positions
-                    # each step — NOT accumulated on top of the previous target.
-                    self.joint_targets = DEFAULT_POSITIONS + action * self.action_scale
+                    # Compute desired targets from policy (offset from default)
+                    desired_targets = DEFAULT_POSITIONS + action * self.action_scale
 
                     # Clamp wrists: without orientation target feedback they drift
-                    self.joint_targets[WRIST_INDICES] = np.clip(
-                        self.joint_targets[WRIST_INDICES],
+                    desired_targets[WRIST_INDICES] = np.clip(
+                        desired_targets[WRIST_INDICES],
                         DEFAULT_POSITIONS[WRIST_INDICES] - WRIST_CLAMP_DELTA,
                         DEFAULT_POSITIONS[WRIST_INDICES] + WRIST_CLAMP_DELTA,
                     )
 
                     # Clip to safe joint limits (from URDF)
-                    self.joint_targets = np.clip(self.joint_targets, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)
+                    desired_targets = np.clip(desired_targets, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)
+
+                    # Rate-limit: cap change per step to MAX_JOINT_DELTA.
+                    # This prevents the OOD transient (and any future large actions)
+                    # from producing target jumps that cause grinding.
+                    delta = np.clip(
+                        desired_targets - self.joint_targets,
+                        -MAX_JOINT_DELTA, MAX_JOINT_DELTA,
+                    )
+                    self.joint_targets = self.joint_targets + delta
+                    # Feedforward velocity = how fast we're actually moving the target
+                    self.joint_velocities = delta / self.control_dt
 
                     # Send commands
                     self.send_joint_commands()
@@ -674,6 +694,7 @@ class G1JointSpaceDeployer:
 
         finally:
             self.running = False
+            self.joint_velocities = np.zeros(14)  # clear feedforward before handoff
             if self.keyboard:
                 self.keyboard.stop()
 
