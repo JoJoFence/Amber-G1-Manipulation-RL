@@ -215,6 +215,12 @@ ACTION_SMOOTH_ALPHA = 0.15
 WAIST_KP = np.array([60.0, 40.0, 40.0])
 WAIST_KD = np.array([1.0, 1.0, 1.0])
 
+# Fixed transform from torso_link to waist_yaw_link (the training BASE_FRAME).
+# Chain: waist_yaw_link -> waist_roll_joint (xyz=[-0.0039635,0,0.035]) ->
+#        waist_roll_link -> waist_pitch_joint (xyz=[0,0,0.019]) -> torso_link
+# Both joints are fixed with zero rotation, so torso_link origin in waist_yaw frame:
+TORSO_IN_WAIST_OFFSET = np.array([-0.0039635, 0.0, 0.054])
+
 
 class KeyboardController:
     """Non-blocking keyboard input for target control."""
@@ -344,9 +350,11 @@ class G1JointSpaceDeployer:
         self.joint_targets = DEFAULT_POSITIONS.copy()
         self.joint_velocities = np.zeros(14)  # feedforward dq sent with each command
 
-        # EE targets for observations (body frame)
-        self.base_left_target = np.array([0.35, 0.20, 0.0])
-        self.base_right_target = np.array([0.35, -0.20, 0.0])
+        # EE targets in waist_yaw_link frame (= training BASE_FRAME).
+        # Training workspace: x∈[0.15,0.30], y(left)∈[0.05,0.22], z∈[0.05,0.25].
+        # Choose mid-range defaults to stay well within the training distribution.
+        self.base_left_target = np.array([0.25, 0.15, 0.15])
+        self.base_right_target = np.array([0.25, -0.15, 0.15])
         self.left_target = self.base_left_target.copy()
         self.right_target = self.base_right_target.copy()
 
@@ -522,9 +530,13 @@ class G1JointSpaceDeployer:
         # Joint positions relative to default
         joint_pos_rel = joint_pos - DEFAULT_POSITIONS
 
-        # Compute EE positions via forward kinematics (body/torso frame)
-        left_ee_pos, _ = self.left_kin.forward_kinematics(joint_pos[0:7])
-        right_ee_pos, _ = self.right_kin.forward_kinematics(joint_pos[7:14])
+        # Compute EE positions via forward kinematics.
+        # G1ArmKinematics outputs in torso_link frame; training used waist_yaw_link
+        # as BASE_FRAME (5.4 cm above torso_link).  Convert to match training frame.
+        left_ee_pos_torso, _ = self.left_kin.forward_kinematics(joint_pos[0:7])
+        right_ee_pos_torso, _ = self.right_kin.forward_kinematics(joint_pos[7:14])
+        left_ee_pos = left_ee_pos_torso + TORSO_IN_WAIST_OFFSET
+        right_ee_pos = right_ee_pos_torso + TORSO_IN_WAIST_OFFSET
         left_ee_error = self.left_target - left_ee_pos
         right_ee_error = self.right_target - right_ee_pos
 
